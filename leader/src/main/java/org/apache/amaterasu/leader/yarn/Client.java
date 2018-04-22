@@ -69,7 +69,11 @@ public class Client {
     }
 
     private void run(JobOpts opts, String[] args) throws Exception {
+        String msg;
 
+        msg = String.format("Now doing the ama-client");
+        System.out.println(msg);
+        LOGGER.info(msg);
         LogManager.resetConfiguration();
         ClusterConfig config = new ClusterConfig();
         config.load(new FileInputStream(opts.home + "/amaterasu.properties"));
@@ -100,7 +104,9 @@ public class Client {
         }
         Path jarPath = new Path(config.YARN().hdfsJarsPath());
         Path jarPathQualified = fs.makeQualified(jarPath);
-
+        msg = String.format("jarPath is %s. jarPathQualified is %s.", jarPath.getName(), jarPathQualified.getName());
+        System.out.println(msg);
+        LOGGER.info(msg);
         ApplicationSubmissionContext appContext = app.getApplicationSubmissionContext();
 
         String newId = "";
@@ -129,29 +135,45 @@ public class Client {
         // Setup local ama folder on hdfs.
         try {
             if (!fs.exists(jarPathQualified)) {
-                File home = new File(opts.home);
+                msg = String.format("%s does not exists on hdfs. Creating.", jarPathQualified);
+                System.out.println(msg);
+                LOGGER.info(msg);
                 fs.mkdirs(jarPathQualified);
-
-                for (File f : home.listFiles()) {
+            }
+            File home = new File(opts.home);
+            for (File f : home.listFiles()) {
+                Path remotePath = jarPathQualified.suffix(f.getName());
+                if(!fs.exists(remotePath)) {
                     fs.copyFromLocalFile(false, true, new Path(f.getAbsolutePath()), jarPathQualified);
                 }
+            }
 
-                // setup frameworks
-                FrameworkProvidersFactory frameworkFactory = FrameworkProvidersFactory.apply(opts.env, config);
-                for (String group : frameworkFactory.groups()) {
-                    FrameworkSetupProvider framework = frameworkFactory.getFramework(group);
+            // setup frameworks
+            FrameworkProvidersFactory frameworkFactory = FrameworkProvidersFactory.apply(opts.env, config);
+            msg = String.format("Copying resources for %d framework groups.", frameworkFactory.groups().length);
+            System.out.println(msg);
+            LOGGER.info(msg);
 
-                    //creating a group folder
-                    Path frameworkPath = Path.mergePaths(jarPathQualified, new Path("/" + framework.getGroupIdentifier()));
-                    System.out.println("===> " + frameworkPath.toString());
+            for (String group : frameworkFactory.groups()) {
+                FrameworkSetupProvider framework = frameworkFactory.getFramework(group);
 
-                    fs.mkdirs(frameworkPath);
-                    for (File file : framework.getGroupResources()) {
-                        if (file.exists())
-                            fs.copyFromLocalFile(false, true, new Path(file.getAbsolutePath()), frameworkPath);
+                msg = String.format("Copying resources for framework group %s with %d files.", framework.getGroupIdentifier(),
+                    framework.getGroupResources().length);
+                System.out.println(msg);
+                LOGGER.info(msg);
+
+                //creating a group folder
+                Path frameworkPath = Path.mergePaths(jarPathQualified, new Path("/" + framework.getGroupIdentifier()));
+                System.out.println("===> " + frameworkPath.toString());
+
+                fs.mkdirs(frameworkPath);
+                for (File file : framework.getGroupResources()) {
+                    if (!file.exists()) {
+                        fs.copyFromLocalFile(false, true, new Path(file.getAbsolutePath()), frameworkPath);
                     }
                 }
             }
+
         } catch (IOException e) {
             LOGGER.error("Error uploading ama folder to HDFS.", e);
             exit(3);
@@ -166,12 +188,16 @@ public class Client {
 
         // get local resources pointers that will be set on the master container env
         String leaderJarPath = String.format("/bin/leader-%s-all.jar", version);
-        LOGGER.info("Leader Jar path is: {}", leaderJarPath);
+        msg = String.format("Leader Jar path is: %s", leaderJarPath);
+        System.out.println(msg);
+        LOGGER.info(msg);
         Path mergedPath = Path.mergePaths(jarPath, new Path(leaderJarPath));
 
         // System.out.println("===> path: " + jarPathQualified);
 
-        LOGGER.info("Leader merged jar path is: {}", mergedPath);
+        msg = String.format("Leader merged jar path is: %s", mergedPath);
+        System.out.println(msg);
+        LOGGER.info(msg);
         LocalResource leaderJar = null;
         LocalResource propFile = null;
         LocalResource log4jPropFile = null;
@@ -212,7 +238,9 @@ public class Client {
 
         // Submit application
         ApplicationId appId = appContext.getApplicationId();
-        LOGGER.info("Submitting application {}", appId);
+        msg = String.format("Submitting application %s", appId);
+        System.out.println(msg);
+        LOGGER.info(msg);
         try {
             yarnClient.submitApplication(appContext);
 
