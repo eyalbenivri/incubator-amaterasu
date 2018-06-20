@@ -21,16 +21,17 @@ import java.net.{InetAddress, ServerSocket, URLEncoder}
 import java.nio.ByteBuffer
 import java.util
 import java.util.concurrent.{ConcurrentHashMap, ConcurrentLinkedQueue, LinkedBlockingQueue}
-
 import javax.jms.Session
+
 import org.apache.activemq.ActiveMQConnectionFactory
 import org.apache.activemq.broker.BrokerService
 import org.apache.amaterasu.common.configuration.ClusterConfig
 import org.apache.amaterasu.common.dataobjects.ActionData
 import org.apache.amaterasu.common.logging.Logging
+import org.apache.amaterasu.leader.common.utilities.DataLoader
 import org.apache.amaterasu.leader.execution.frameworks.FrameworkProvidersFactory
 import org.apache.amaterasu.leader.execution.{JobLoader, JobManager}
-import org.apache.amaterasu.leader.utilities.{ActiveReportListener, Args, DataLoader}
+import org.apache.amaterasu.leader.utilities.{ActiveReportListener, Args}
 import org.apache.curator.framework.recipes.barriers.DistributedBarrier
 import org.apache.curator.framework.{CuratorFramework, CuratorFrameworkFactory}
 import org.apache.curator.retry.ExponentialBackoffRetry
@@ -102,8 +103,6 @@ class ApplicationMaster extends AMRMClientAsync.CallbackHandler with Logging {
     fileResource
 
   }
-
-
 
   def execute(arguments: Args): Unit = {
 
@@ -271,19 +270,19 @@ class ApplicationMaster extends AMRMClientAsync.CallbackHandler with Logging {
             val taskData = DataLoader.getTaskDataString(actionData, env)
             val execData = DataLoader.getExecutorDataString(env, config)
 
-            val ctx = Records.newRecord(classOf[ContainerLaunchContext])
-            val commands: List[String] = List(
-              "/bin/bash ./miniconda.sh -b -p $PWD/miniconda && ",
-              s"/bin/bash spark/bin/load-spark-env.sh && ",
-              s"java -cp spark/jars/*:executor.jar:spark/conf/:${config.YARN.hadoopHomeDir}/conf/ " +
-                "-Xmx1G " +
-                "-Dscala.usejavacp=true " +
-                "-Dhdp.version=2.6.1.0-129 " +
-                "org.apache.amaterasu.executor.yarn.executors.ActionsExecutorLauncher " +
-                s"'${jobManager.jobId}' '${config.master}' '${actionData.name}' '${URLEncoder.encode(taskData, "UTF-8")}' '${URLEncoder.encode(execData, "UTF-8")}' '${actionData.id}-${container.getId.getContainerId}' '$address' " +
-                s"1> ${ApplicationConstants.LOG_DIR_EXPANSION_VAR}/stdout " +
-                s"2> ${ApplicationConstants.LOG_DIR_EXPANSION_VAR}/stderr "
-            )
+        val ctx = Records.newRecord(classOf[ContainerLaunchContext])
+        val commands: List[String] = List(
+          "/bin/bash ./miniconda.sh -b -p $PWD/miniconda && ",
+          s"/bin/bash spark/bin/load-spark-env.sh && ",
+          s"java -cp spark/jars/*:executor.jar:spark-runner.jar:spark-runtime.jar:spark/conf/:${config.YARN.hadoopHomeDir}/conf/ " +
+            "-Xmx2G " +
+            "-Dscala.usejavacp=true " +
+            "-Dhdp.version=2.6.1.0-129 " +
+            "org.apache.amaterasu.executor.yarn.executors.ActionsExecutorLauncher " +
+            s"'${jobManager.jobId}' '${config.master}' '${actionData.name}' '${URLEncoder.encode(taskData, "UTF-8")}' '${URLEncoder.encode(execData, "UTF-8")}' '${actionData.id}-${container.getId.getContainerId}' '$address' " +
+            s"1> ${ApplicationConstants.LOG_DIR_EXPANSION_VAR}/stdout " +
+            s"2> ${ApplicationConstants.LOG_DIR_EXPANSION_VAR}/stderr "
+        )
 
             log.info("Running container id {}.", container.getId.getContainerId)
             log.info("Running container id {} with command '{}'", container.getId.getContainerId, commands.last)
@@ -300,13 +299,37 @@ class ApplicationMaster extends AMRMClientAsync.CallbackHandler with Logging {
               "runtime.py" -> setLocalResourceFromPath(Path.mergePaths(jarPath, new Path("/dist/runtime.py"))),
               "spark-version-info.properties" -> setLocalResourceFromPath(Path.mergePaths(jarPath, new Path("/dist/spark-version-info.properties"))),
               "spark_intp.py" -> setLocalResourceFromPath(Path.mergePaths(jarPath, new Path("/dist/spark_intp.py"))))
+        val yarnJarPath = new Path(config.YARN.hdfsJarsPath)
+
+        //TODO Arun - Remove the hardcoding of the dist path
+        /*  val resources = mutable.Map[String, LocalResource]()
+          val binaryFileIter = fs.listFiles(new Path(s"${config.YARN.hdfsJarsPath}/dist"), false)
+          while (binaryFileIter.hasNext) {
+            val eachFile = binaryFileIter.next().getPath
+            resources (eachFile.getName) = setLocalResourceFromPath(fs.makeQualified(eachFile))
+          }
+          resources("log4j.properties") = setLocalResourceFromPath(fs.makeQualified(new Path(s"${config.YARN.hdfsJarsPath}/log4j.properties")))
+          resources ("amaterasu.properties") = setLocalResourceFromPath(fs.makeQualified(new Path(s"${config.YARN.hdfsJarsPath}/amaterasu.properties")))*/
+
+            val resources = mutable.Map[String, LocalResource](
+              "executor.jar" -> setLocalResourceFromPath(Path.mergePaths(yarnJarPath, new Path(s"/dist/executor-${config.version}-all.jar"))),
+              "spark-runner.jar" -> setLocalResourceFromPath(Path.mergePaths(yarnJarPath, new Path(s"/dist/spark-runner-${config.version}-all.jar"))),
+              "spark-runtime.jar" -> setLocalResourceFromPath(Path.mergePaths(yarnJarPath, new Path(s"/dist/spark-runtime-${config.version}.jar"))),
+              "amaterasu.properties" -> setLocalResourceFromPath(Path.mergePaths(yarnJarPath, new Path("/amaterasu.properties"))),
+              "log4j.properties" -> setLocalResourceFromPath(Path.mergePaths(yarnJarPath, new Path("/log4j.properties"))),
+              // TODO: Nadav/Eyal all of these should move to the executor resource setup
+              "miniconda.sh" -> setLocalResourceFromPath(Path.mergePaths(yarnJarPath, new Path("/dist/miniconda.sh"))),
+              "codegen.py" -> setLocalResourceFromPath(Path.mergePaths(yarnJarPath, new Path("/dist/codegen.py"))),
+              "runtime.py" -> setLocalResourceFromPath(Path.mergePaths(yarnJarPath, new Path("/dist/runtime.py"))),
+              "spark-version-info.properties" -> setLocalResourceFromPath(Path.mergePaths(yarnJarPath, new Path("/dist/spark-version-info.properties"))),
+              "spark_intp.py" -> setLocalResourceFromPath(Path.mergePaths(yarnJarPath, new Path("/dist/spark_intp.py"))))
 
             val frameworkFactory = FrameworkProvidersFactory(env, config)
             val framework = frameworkFactory.getFramework(actionData.groupId)
 
             //adding the framework and executor resources
-            setupResources(framework.getGroupIdentifier, resources, framework.getGroupIdentifier)
-            setupResources(s"${framework.getGroupIdentifier}/${actionData.typeId}", resources, s"${framework.getGroupIdentifier}-${actionData.typeId}")
+            setupResources(yarnJarPath, framework.getGroupIdentifier, resources, framework.getGroupIdentifier)
+            setupResources(yarnJarPath, s"${framework.getGroupIdentifier}/${actionData.typeId}", resources, s"${framework.getGroupIdentifier}-${actionData.typeId}")
 
             ctx.setLocalResources(resources)
 
@@ -355,9 +378,9 @@ class ApplicationMaster extends AMRMClientAsync.CallbackHandler with Logging {
     ByteBuffer.wrap(dob.getData, 0, dob.getLength)
   }
 
-  private def setupResources(frameworkPath: String, countainerResources: mutable.Map[String, LocalResource], resourcesPath: String): Unit = {
+  private def setupResources(yarnJarPath: Path, frameworkPath: String, countainerResources: mutable.Map[String, LocalResource], resourcesPath: String): Unit = {
 
-    val sourcePath = Path.mergePaths(jarPath, new Path(s"/$resourcesPath"))
+    val sourcePath = Path.mergePaths(yarnJarPath, new Path(s"/$resourcesPath"))
 
     if (fs.exists(sourcePath)) {
 
