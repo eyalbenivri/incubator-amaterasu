@@ -17,12 +17,12 @@
 package org.apache.amaterasu.leader.yarn
 
 import java.io.{File, FileInputStream, InputStream}
-import java.net.{InetAddress, ServerSocket}
+import java.net.{InetAddress, ServerSocket, URLEncoder}
 import java.nio.ByteBuffer
 import java.util
-import java.util.concurrent.{ConcurrentHashMap, LinkedBlockingQueue}
-import javax.jms.Session
+import java.util.concurrent.{ConcurrentHashMap, ConcurrentLinkedQueue, LinkedBlockingQueue}
 
+import javax.jms.Session
 import org.apache.activemq.ActiveMQConnectionFactory
 import org.apache.activemq.broker.BrokerService
 import org.apache.amaterasu.common.configuration.ClusterConfig
@@ -30,13 +30,14 @@ import org.apache.amaterasu.common.dataobjects.ActionData
 import org.apache.amaterasu.common.logging.Logging
 import org.apache.amaterasu.leader.execution.frameworks.FrameworkProvidersFactory
 import org.apache.amaterasu.leader.execution.{JobLoader, JobManager}
-import org.apache.amaterasu.leader.utilities.{ActiveReportListener, Args}
+import org.apache.amaterasu.leader.utilities.{ActiveReportListener, Args, DataLoader}
 import org.apache.curator.framework.recipes.barriers.DistributedBarrier
 import org.apache.curator.framework.{CuratorFramework, CuratorFrameworkFactory}
 import org.apache.curator.retry.ExponentialBackoffRetry
 import org.apache.hadoop.fs.{FileSystem, Path}
 import org.apache.hadoop.io.DataOutputBuffer
 import org.apache.hadoop.security.UserGroupInformation
+import org.apache.hadoop.yarn.api.ApplicationConstants
 import org.apache.hadoop.yarn.api.records._
 import org.apache.hadoop.yarn.client.api.AMRMClient.ContainerRequest
 import org.apache.hadoop.yarn.client.api.async.impl.NMClientAsyncImpl
@@ -53,9 +54,10 @@ import scala.concurrent.ExecutionContext.Implicits.global
 import scala.concurrent.Future
 import scala.util.{Failure, Success}
 
+
 class ApplicationMaster extends AMRMClientAsync.CallbackHandler with Logging {
 
-  var capability: Resource = _
+
 
   log.info("ApplicationMaster start")
 
@@ -77,10 +79,13 @@ class ApplicationMaster extends AMRMClientAsync.CallbackHandler with Logging {
   private var allocListener: YarnRMCallbackHandler = _
   private var rmClient: AMRMClientAsync[ContainerRequest] = _
   private var address: String = _
+  private var frameworkFactory: FrameworkProvidersFactory = _
+  private var maxMem:Int  = _
+  private var maxVCores:Int  = _
 
+  private val containerResourcesToTasks = new ConcurrentHashMap[Resource, ConcurrentLinkedQueue[ActionData]].asScala
   private val containersIdsToTask: concurrent.Map[Long, ActionData] = new ConcurrentHashMap[Long, ActionData].asScala
   private val completedContainersAndTaskIds: concurrent.Map[Long, String] = new ConcurrentHashMap[Long, String].asScala
-  private val actionsBuffer: java.util.concurrent.ConcurrentLinkedQueue[ActionData] = new java.util.concurrent.ConcurrentLinkedQueue[ActionData]()
   private val host: String = InetAddress.getLocalHost.getHostName
   private val broker: BrokerService = new BrokerService()
 
@@ -97,6 +102,8 @@ class ApplicationMaster extends AMRMClientAsync.CallbackHandler with Logging {
     fileResource
 
   }
+
+
 
   def execute(arguments: Args): Unit = {
 
@@ -154,36 +161,41 @@ class ApplicationMaster extends AMRMClientAsync.CallbackHandler with Logging {
 
     rmClient = startRMClient()
     val registrationResponse = registerAppMaster("", 0, "")
-    val maxMem = registrationResponse.getMaximumResourceCapability.getMemory
+    maxMem = registrationResponse.getMaximumResourceCapability.getMemory
     log.info("Max mem capability of resources in this cluster " + maxMem)
-    val maxVCores = registrationResponse.getMaximumResourceCapability.getVirtualCores
+    maxVCores = registrationResponse.getMaximumResourceCapability.getVirtualCores
     log.info("Max vcores capability of resources in this cluster " + maxVCores)
     log.info(s"Created jobManager. jobManager.registeredActions.size: ${jobManager.registeredActions.size}")
 
     // Resource requirements for worker containers
-    this.capability = Records.newRecord(classOf[Resource])
-    val frameworkFactory = FrameworkProvidersFactory.apply(env, config)
+    frameworkFactory = FrameworkProvidersFactory.apply(env, config)
 
     while (!jobManager.outOfActions) {
       val actionData = jobManager.getNextActionData
       if (actionData != null) {
 
-        val frameworkProvider = frameworkFactory.providers(actionData.groupId)
-        val driverConfiguration = frameworkProvider.getDriverConfiguration
+        val capability: Resource = getCapabilityFromAction(actionData)
 
-        var mem: Int = driverConfiguration.getMemory
-        mem = Math.min(mem, maxMem)
-        this.capability.setMemory(mem)
-
-        var cpu = driverConfiguration.getCPUs
-        cpu = Math.min(cpu, maxVCores)
-        this.capability.setVirtualCores(cpu)
-
-        askContainer(actionData)
+        askContainer(actionData, capability)
       }
     }
 
     log.info("Finished asking for containers")
+  }
+
+  private def getCapabilityFromAction(actionData: ActionData) = {
+    val frameworkProvider = frameworkFactory.providers(actionData.groupId)
+    val driverConfiguration = frameworkProvider.getDriverConfiguration
+
+    val capability = Records.newRecord(classOf[Resource])
+    var mem: Int = driverConfiguration.getMemory
+    mem = Math.min(mem, maxMem)
+    capability.setMemory(mem)
+
+    var cpu = driverConfiguration.getCPUs
+    cpu = Math.min(cpu, maxVCores)
+    capability.setVirtualCores(cpu)
+    capability
   }
 
   private def startRMClient(): AMRMClientAsync[ContainerRequest] = {
@@ -216,10 +228,10 @@ class ApplicationMaster extends AMRMClientAsync.CallbackHandler with Logging {
 
   }
 
-  private def askContainer(actionData: ActionData): Unit = {
+  private def askContainer(actionData: ActionData, capability: Resource): Unit = {
 
-    actionsBuffer.add(actionData)
-    log.info(s"About to ask container for action ${actionData.id}. Action buffer size is: ${actionsBuffer.size()}")
+    containerResourcesToTasks.getOrElseUpdate(capability, new ConcurrentLinkedQueue[ActionData]()).add(actionData)
+    log.info(s"About to ask container for action ${actionData.id}. Action buffer size is: ${containerResourcesToTasks.values.map(q => q.size()).sum}")
 
     // we have an action to schedule, let's request a container
     val priority: Priority = Records.newRecord(classOf[Priority])
@@ -230,83 +242,99 @@ class ApplicationMaster extends AMRMClientAsync.CallbackHandler with Logging {
 
   }
 
+  def resourceToString(resource: Resource): String = {
+    s"Resource<${resource.getVirtualCores} vcores, ${resource.getMemory} mem>"
+  }
+
   override def onContainersAllocated(containers: util.List[Container]): Unit = {
 
     log.info(s"${containers.size()} Containers allocated")
+    if (containerResourcesToTasks.values.forall(_.isEmpty)) {
+      log.warn(s"Why actionBuffer empty and i was called?. Container ids: ${containers.map(c => c.getId.getContainerId)}")
+      return
+    }
     for (container <- containers.asScala) { // Launch container by create ContainerLaunchContext
-      if (actionsBuffer.isEmpty) {
-        log.warn(s"Why actionBuffer empty and i was called?. Container ids: ${containers.map(c => c.getId.getContainerId)}")
-        return
-      }
+      val actionDataQueue: Option[ConcurrentLinkedQueue[ActionData]] = containerResourcesToTasks.get(container.getResource)
+      if(actionDataQueue.isEmpty) {
+        log.warn(s"Found new container with id ${container.getId}, and capability ${resourceToString(container.getResource)}, " +
+          s"but no tasks were queued for that resource. " +
+          s"Requested resources: ${containerResourcesToTasks.keys.map(resourceToString(_))}.")
+      } else {
+        val actionData = actionDataQueue.get.poll()
+        if (actionData == null) {
+          log.warn(s"Found new container with id ${container.getId}, and capability ${resourceToString(container.getResource)}, " +
+            s"but no tasks were queued for that resource, although exists on map. " +
+            s"Requested resources: ${containerResourcesToTasks.keys.map(resourceToString(_))}.")
+        } else {
+          val containerTask = Future[ActionData] {
 
-      val actionData = actionsBuffer.poll()
-      val containerTask = Future[ActionData] {
+            val taskData = DataLoader.getTaskDataString(actionData, env)
+            val execData = DataLoader.getExecutorDataString(env, config)
 
-        val frameworkFactory = FrameworkProvidersFactory(env, config)
-        val framework = frameworkFactory.getFramework(actionData.groupId)
-        val runnerProvider = framework.getRunnerProvider(actionData.typeId)
-        val ctx = Records.newRecord(classOf[ContainerLaunchContext])
-        val commands: List[String] = List(runnerProvider.getCommand(jobManager.jobId, actionData, env, s"${actionData.id}-${container.getId.getContainerId}", address))
+            val ctx = Records.newRecord(classOf[ContainerLaunchContext])
+            val commands: List[String] = List(
+              "/bin/bash ./miniconda.sh -b -p $PWD/miniconda && ",
+              s"/bin/bash spark/bin/load-spark-env.sh && ",
+              s"java -cp spark/jars/*:executor.jar:spark/conf/:${config.YARN.hadoopHomeDir}/conf/ " +
+                "-Xmx1G " +
+                "-Dscala.usejavacp=true " +
+                "-Dhdp.version=2.6.1.0-129 " +
+                "org.apache.amaterasu.executor.yarn.executors.ActionsExecutorLauncher " +
+                s"'${jobManager.jobId}' '${config.master}' '${actionData.name}' '${URLEncoder.encode(taskData, "UTF-8")}' '${URLEncoder.encode(execData, "UTF-8")}' '${actionData.id}-${container.getId.getContainerId}' '$address' " +
+                s"1> ${ApplicationConstants.LOG_DIR_EXPANSION_VAR}/stdout " +
+                s"2> ${ApplicationConstants.LOG_DIR_EXPANSION_VAR}/stderr "
+            )
 
-        log.info("Running container id {}.", container.getId.getContainerId)
-        log.info("Running container id {} with command '{}'", container.getId.getContainerId, commands.last)
+            log.info("Running container id {}.", container.getId.getContainerId)
+            log.info("Running container id {} with command '{}'", container.getId.getContainerId, commands.last)
 
-        ctx.setCommands(commands)
-        ctx.setTokens(allTokens)
+            ctx.setCommands(commands)
+            ctx.setTokens(allTokens)
 
-        val yarnJarPath = new Path(config.YARN.hdfsJarsPath)
+            val resources = mutable.Map[String, LocalResource](
+              "executor.jar" -> executorJar,
+              "amaterasu.properties" -> propFile,
+              // TODO: Nadav/Eyal all of these should move to the executor resource setup
+              "miniconda.sh" -> setLocalResourceFromPath(Path.mergePaths(jarPath, new Path("/dist/Miniconda2-latest-Linux-x86_64.sh"))),
+              "codegen.py" -> setLocalResourceFromPath(Path.mergePaths(jarPath, new Path("/dist/codegen.py"))),
+              "runtime.py" -> setLocalResourceFromPath(Path.mergePaths(jarPath, new Path("/dist/runtime.py"))),
+              "spark-version-info.properties" -> setLocalResourceFromPath(Path.mergePaths(jarPath, new Path("/dist/spark-version-info.properties"))),
+              "spark_intp.py" -> setLocalResourceFromPath(Path.mergePaths(jarPath, new Path("/dist/spark_intp.py"))))
 
-        //TODO Arun - Remove the hardcoding of the dist path
-        /*  val resources = mutable.Map[String, LocalResource]()
-          val binaryFileIter = fs.listFiles(new Path(s"${config.YARN.hdfsJarsPath}/dist"), false)
-          while (binaryFileIter.hasNext) {
-            val eachFile = binaryFileIter.next().getPath
-            resources (eachFile.getName) = setLocalResourceFromPath(fs.makeQualified(eachFile))
+            val frameworkFactory = FrameworkProvidersFactory(env, config)
+            val framework = frameworkFactory.getFramework(actionData.groupId)
+
+            //adding the framework and executor resources
+            setupResources(framework.getGroupIdentifier, resources, framework.getGroupIdentifier)
+            setupResources(s"${framework.getGroupIdentifier}/${actionData.typeId}", resources, s"${framework.getGroupIdentifier}-${actionData.typeId}")
+
+            ctx.setLocalResources(resources)
+
+            ctx.setEnvironment(Map[String, String](
+              "HADOOP_CONF_DIR" -> s"${config.YARN.hadoopHomeDir}/conf/",
+              "YARN_CONF_DIR" -> s"${config.YARN.hadoopHomeDir}/conf/",
+              "AMA_NODE" -> sys.env("AMA_NODE"),
+              "HADOOP_USER_NAME" -> UserGroupInformation.getCurrentUser.getUserName
+            ))
+
+            log.info(s"hadoop conf dir is ${config.YARN.hadoopHomeDir}/conf/")
+            nmClient.startContainerAsync(container, ctx)
+            actionData
           }
-          resources("log4j.properties") = setLocalResourceFromPath(fs.makeQualified(new Path(s"${config.YARN.hdfsJarsPath}/log4j.properties")))
-          resources ("amaterasu.properties") = setLocalResourceFromPath(fs.makeQualified(new Path(s"${config.YARN.hdfsJarsPath}/amaterasu.properties")))*/
 
-        val resources = mutable.Map[String, LocalResource](
-          "executor.jar" -> setLocalResourceFromPath(Path.mergePaths(yarnJarPath, new Path(s"/dist/executor-${config.version}-all.jar"))),
-          "spark-runner.jar" -> setLocalResourceFromPath(Path.mergePaths(yarnJarPath, new Path(s"/dist/spark-runner-${config.version}-all.jar"))),
-          "spark-runtime.jar" -> setLocalResourceFromPath(Path.mergePaths(yarnJarPath, new Path(s"/dist/spark-runtime-${config.version}.jar"))),
-          "amaterasu.properties" -> setLocalResourceFromPath(Path.mergePaths(yarnJarPath, new Path("/amaterasu.properties"))),
-          "log4j.properties" -> setLocalResourceFromPath(Path.mergePaths(yarnJarPath, new Path("/log4j.properties"))),
-          // TODO: Nadav/Eyal all of these should move to the executor resource setup
-          "miniconda.sh" -> setLocalResourceFromPath(Path.mergePaths(yarnJarPath, new Path("/dist/miniconda.sh"))),
-          "codegen.py" -> setLocalResourceFromPath(Path.mergePaths(yarnJarPath, new Path("/dist/codegen.py"))),
-          "runtime.py" -> setLocalResourceFromPath(Path.mergePaths(yarnJarPath, new Path("/dist/runtime.py"))),
-          "spark-version-info.properties" -> setLocalResourceFromPath(Path.mergePaths(yarnJarPath, new Path("/dist/spark-version-info.properties"))),
-          "spark_intp.py" -> setLocalResourceFromPath(Path.mergePaths(yarnJarPath, new Path("/dist/spark_intp.py"))))
+          containerTask onComplete {
+            case Failure(t) =>
+              log.error(s"launching container failed", t)
+              val capability: Resource = getCapabilityFromAction(actionData)
+              askContainer(actionData, capability)
 
-        //adding the framework and executor resources
-        setupResources(yarnJarPath, framework.getGroupIdentifier, resources, framework.getGroupIdentifier)
-        setupResources(yarnJarPath, s"${framework.getGroupIdentifier}/${actionData.typeId}", resources, s"${framework.getGroupIdentifier}-${actionData.typeId}")
+            case Success(requestedActionData) =>
+              jobManager.actionStarted(requestedActionData.id)
+              containersIdsToTask.put(container.getId.getContainerId, requestedActionData)
+              log.info(s"launching container succeeded: ${container.getId.getContainerId}; task: ${requestedActionData.id}")
 
-        ctx.setLocalResources(resources)
-
-        ctx.setEnvironment(Map[String, String](
-          "HADOOP_CONF_DIR" -> s"${config.YARN.hadoopHomeDir}/conf/",
-          "YARN_CONF_DIR" -> s"${config.YARN.hadoopHomeDir}/conf/",
-          "AMA_NODE" -> sys.env("AMA_NODE"),
-          "HADOOP_USER_NAME" -> UserGroupInformation.getCurrentUser.getUserName
-        ))
-
-        log.info(s"hadoop conf dir is ${config.YARN.hadoopHomeDir}/conf/")
-        nmClient.startContainerAsync(container, ctx)
-        actionData
-      }
-
-      containerTask onComplete {
-        case Failure(t) =>
-          log.error(s"launching container failed", t)
-          askContainer(actionData)
-
-        case Success(requestedActionData) =>
-          jobManager.actionStarted(requestedActionData.id)
-          containersIdsToTask.put(container.getId.getContainerId, requestedActionData)
-          log.info(s"launching container succeeded: ${container.getId.getContainerId}; task: ${requestedActionData.id}")
-
+          }
+        }
       }
     }
   }
@@ -327,9 +355,9 @@ class ApplicationMaster extends AMRMClientAsync.CallbackHandler with Logging {
     ByteBuffer.wrap(dob.getData, 0, dob.getLength)
   }
 
-  private def setupResources(yarnJarPath: Path, frameworkPath: String, countainerResources: mutable.Map[String, LocalResource], resourcesPath: String): Unit = {
+  private def setupResources(frameworkPath: String, countainerResources: mutable.Map[String, LocalResource], resourcesPath: String): Unit = {
 
-    val sourcePath = Path.mergePaths(yarnJarPath, new Path(s"/$resourcesPath"))
+    val sourcePath = Path.mergePaths(jarPath, new Path(s"/$resourcesPath"))
 
     if (fs.exists(sourcePath)) {
 
