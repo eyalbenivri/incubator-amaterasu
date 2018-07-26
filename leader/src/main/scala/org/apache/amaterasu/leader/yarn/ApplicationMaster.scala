@@ -17,18 +17,17 @@
 package org.apache.amaterasu.leader.yarn
 
 import java.io.{File, FileInputStream, InputStream}
-import java.net.{InetAddress, ServerSocket, URLEncoder}
+import java.net.{InetAddress, ServerSocket}
 import java.nio.ByteBuffer
 import java.util
 import java.util.concurrent.{ConcurrentHashMap, LinkedBlockingQueue}
-
 import javax.jms.Session
+
 import org.apache.activemq.ActiveMQConnectionFactory
 import org.apache.activemq.broker.BrokerService
 import org.apache.amaterasu.common.configuration.ClusterConfig
 import org.apache.amaterasu.common.dataobjects.ActionData
 import org.apache.amaterasu.common.logging.Logging
-import org.apache.amaterasu.leader.common.utilities.DataLoader
 import org.apache.amaterasu.leader.execution.frameworks.FrameworkProvidersFactory
 import org.apache.amaterasu.leader.execution.{JobLoader, JobManager}
 import org.apache.amaterasu.leader.utilities.{ActiveReportListener, Args}
@@ -38,12 +37,10 @@ import org.apache.curator.retry.ExponentialBackoffRetry
 import org.apache.hadoop.fs.{FileSystem, Path}
 import org.apache.hadoop.io.DataOutputBuffer
 import org.apache.hadoop.security.UserGroupInformation
-import org.apache.hadoop.yarn.api.ApplicationConstants
 import org.apache.hadoop.yarn.api.records._
-import org.apache.hadoop.yarn.client.api.AMRMClient
 import org.apache.hadoop.yarn.client.api.AMRMClient.ContainerRequest
-import org.apache.hadoop.yarn.client.api.async.NMClientAsync
 import org.apache.hadoop.yarn.client.api.async.impl.NMClientAsyncImpl
+import org.apache.hadoop.yarn.client.api.async.{AMRMClientAsync, NMClientAsync}
 import org.apache.hadoop.yarn.conf.YarnConfiguration
 import org.apache.hadoop.yarn.security.AMRMTokenIdentifier
 import org.apache.hadoop.yarn.util.{ConverterUtils, Records}
@@ -56,17 +53,19 @@ import scala.concurrent.ExecutionContext.Implicits.global
 import scala.concurrent.Future
 import scala.util.{Failure, Success}
 
+class ApplicationMaster extends AMRMClientAsync.CallbackHandler with Logging {
 
-class ApplicationMaster extends Logging {
+  var capability: Resource = _
+
   log.info("ApplicationMaster start")
 
   private var jobManager: JobManager = _
-  private var zkClient: CuratorFramework = _
-  private var amaClusterConfig: ClusterConfig = _
+  private var client: CuratorFramework = _
+  private var config: ClusterConfig = _
   private var env: String = _
   private var branch: String = _
-  private var hdfs: FileSystem = _
-  private var yarnConfiguration: YarnConfiguration = _
+  private var fs: FileSystem = _
+  private var conf: YarnConfiguration = _
   private var propPath: String = ""
   private var props: InputStream = _
   private var jarPath: Path = _
@@ -76,20 +75,18 @@ class ApplicationMaster extends Logging {
   private var log4jPropFile: LocalResource = _
   private var nmClient: NMClientAsync = _
   private var allocListener: YarnRMCallbackHandler = _
-  private var rmClient: AMRMClient[ContainerRequest] = _
+  private var rmClient: AMRMClientAsync[ContainerRequest] = _
   private var address: String = _
-  private var frameworkFactory: FrameworkProvidersFactory = _
-  private var maxMem: Int = _
-  private var maxVCores: Int = _
 
   private val containersIdsToTask: concurrent.Map[Long, ActionData] = new ConcurrentHashMap[Long, ActionData].asScala
   private val completedContainersAndTaskIds: concurrent.Map[Long, String] = new ConcurrentHashMap[Long, String].asScala
+  private val actionsBuffer: java.util.concurrent.ConcurrentLinkedQueue[ActionData] = new java.util.concurrent.ConcurrentLinkedQueue[ActionData]()
   private val host: String = InetAddress.getLocalHost.getHostName
   private val broker: BrokerService = new BrokerService()
 
   def setLocalResourceFromPath(path: Path): LocalResource = {
 
-    val stat = hdfs.getFileStatus(path)
+    val stat = fs.getFileStatus(path)
     val fileResource = Records.newRecord(classOf[LocalResource])
 
     fileResource.setResource(ConverterUtils.getYarnUrlFromPath(path))
@@ -110,10 +107,10 @@ class ApplicationMaster extends Logging {
 
     // no need for hdfs double check (nod to Aaron Rodgers)
     // jars on HDFS should have been verified by the YARN client
-    yarnConfiguration = new YarnConfiguration()
-    hdfs = FileSystem.get(yarnConfiguration)
+    conf = new YarnConfiguration()
+    fs = FileSystem.get(conf)
 
-    amaClusterConfig = ClusterConfig(props)
+    config = ClusterConfig(props)
 
     try {
       initJob(arguments)
@@ -123,23 +120,22 @@ class ApplicationMaster extends Logging {
 
     // now that the job was initiated, the curator client is started and we can
     // register the broker's address
-    // TODO: When first attempt fails, this will throw an error on the 2nd attempt
-    zkClient.create().withMode(CreateMode.PERSISTENT).forPath(s"/${jobManager.jobId}/broker")
-    zkClient.setData().forPath(s"/${jobManager.jobId}/broker", address.getBytes)
+    client.create().withMode(CreateMode.PERSISTENT).forPath(s"/${jobManager.jobId}/broker")
+    client.setData().forPath(s"/${jobManager.jobId}/broker", address.getBytes)
 
     // once the broker is registered, we can remove the barrier so clients can connect
     log.info(s"/${jobManager.jobId}-report-barrier")
-    val barrier = new DistributedBarrier(zkClient, s"/${jobManager.jobId}-report-barrier")
+    val barrier = new DistributedBarrier(client, s"/${jobManager.jobId}-report-barrier")
     barrier.removeBarrier()
 
     setupMessaging(jobManager.jobId)
 
     log.info(s"Job ${jobManager.jobId} initiated with ${jobManager.registeredActions.size} actions")
 
-    jarPath = new Path(amaClusterConfig.YARN.hdfsJarsPath)
+    jarPath = new Path(config.YARN.hdfsJarsPath)
 
     // TODO: change this to read all dist folder and add to exec path
-    executorPath = Path.mergePaths(jarPath, new Path(s"/dist/executor-${amaClusterConfig.version}-all.jar"))
+    executorPath = Path.mergePaths(jarPath, new Path(s"/dist/executor-${config.version}-all.jar"))
     log.info("Executor jar path is {}", executorPath)
     executorJar = setLocalResourceFromPath(executorPath)
     propFile = setLocalResourceFromPath(Path.mergePaths(jarPath, new Path("/amaterasu.properties")))
@@ -150,54 +146,49 @@ class ApplicationMaster extends Logging {
     nmClient = new NMClientAsyncImpl(new YarnNMCallbackHandler())
 
     // Initialize clients to ResourceManager and NodeManagers
-    nmClient.init(yarnConfiguration)
+    nmClient.init(conf)
     nmClient.start()
 
     // TODO: awsEnv currently set to empty string. should be changed to read values from (where?).
-    allocListener = new YarnRMCallbackHandler(nmClient, jobManager, env, awsEnv = "", amaClusterConfig, executorJar)
+    allocListener = new YarnRMCallbackHandler(nmClient, jobManager, env, awsEnv = "", config, executorJar)
 
     rmClient = startRMClient()
     val registrationResponse = registerAppMaster("", 0, "")
-    maxMem = registrationResponse.getMaximumResourceCapability.getMemory
+    val maxMem = registrationResponse.getMaximumResourceCapability.getMemory
     log.info("Max mem capability of resources in this cluster " + maxMem)
-    maxVCores = registrationResponse.getMaximumResourceCapability.getVirtualCores
+    val maxVCores = registrationResponse.getMaximumResourceCapability.getVirtualCores
     log.info("Max vcores capability of resources in this cluster " + maxVCores)
     log.info(s"Created jobManager. jobManager.registeredActions.size: ${jobManager.registeredActions.size}")
 
     // Resource requirements for worker containers
-    frameworkFactory = FrameworkProvidersFactory.apply(env, amaClusterConfig)
+    this.capability = Records.newRecord(classOf[Resource])
+    val frameworkFactory = FrameworkProvidersFactory.apply(env, config)
 
     while (!jobManager.outOfActions) {
       val actionData = jobManager.getNextActionData
       if (actionData != null) {
 
-        val capability: Resource = getCapabilityFromAction(actionData)
+        val frameworkProvider = frameworkFactory.providers(actionData.groupId)
+        val driverConfiguration = frameworkProvider.getDriverConfiguration
 
-        askContainer(actionData, capability)
+        var mem: Int = driverConfiguration.getMemory
+        mem = Math.min(mem, maxMem)
+        this.capability.setMemory(mem)
+
+        var cpu = driverConfiguration.getCPUs
+        cpu = Math.min(cpu, maxVCores)
+        this.capability.setVirtualCores(cpu)
+
+        askContainer(actionData)
       }
     }
 
     log.info("Finished asking for containers")
   }
 
-  private def getCapabilityFromAction(actionData: ActionData) = {
-    val frameworkProvider = frameworkFactory.providers(actionData.groupId)
-    val driverConfiguration = frameworkProvider.getDriverConfiguration
-
-    val capability = Records.newRecord(classOf[Resource])
-    var mem: Int = driverConfiguration.getMemory
-    mem = Math.min(mem, maxMem)
-    capability.setMemory(mem)
-
-    var cpu = driverConfiguration.getCPUs
-    cpu = Math.min(cpu, maxVCores)
-    capability.setVirtualCores(cpu)
-    capability
-  }
-
-  private def startRMClient(): AMRMClient[ContainerRequest] = {
-    val client = AMRMClient.createAMRMClient[ContainerRequest]()
-    client.init(yarnConfiguration)
+  private def startRMClient(): AMRMClientAsync[ContainerRequest] = {
+    val client = AMRMClientAsync.createAMRMClientAsync[ContainerRequest](1000, this)
+    client.init(conf)
     client.start()
     client
   }
@@ -225,44 +216,37 @@ class ApplicationMaster extends Logging {
 
   }
 
-  private def askContainer(actionData: ActionData, capability: Resource): Unit = {
+  private def askContainer(actionData: ActionData): Unit = {
+
+    actionsBuffer.add(actionData)
+    log.info(s"About to ask container for action ${actionData.id}. Action buffer size is: ${actionsBuffer.size()}")
+
     // we have an action to schedule, let's request a container
-    val priority = Priority.newInstance(1)
+    val priority: Priority = Records.newRecord(classOf[Priority])
+    priority.setPriority(1)
     val containerReq = new ContainerRequest(capability, null, null, priority)
     rmClient.addContainerRequest(containerReq)
     log.info(s"Asked container for action ${actionData.id}")
-    val allocateResponse = rmClient.allocate(this.getProgress)
-    // only -* NEWLY *- allocated containers should be here, so as long as we ask for them one at a time, we can assume the list will contain 1 container (or 0),
-    // which mean we can just activate the current task.
-    // having said that, after that, we should launch the command on the container using a thread, to not block more actions.
-    this.onContainersAllocated(allocateResponse.getAllocatedContainers, actionData)
+
   }
 
-  def resourceToString(resource: Resource): String = {
-    s"Resource<${resource.getVirtualCores} vcores, ${resource.getMemory} mem>"
-  }
+  override def onContainersAllocated(containers: util.List[Container]): Unit = {
 
-  def onContainersAllocated(containers: util.List[Container], actionData: ActionData): Unit = {
     log.info(s"${containers.size()} Containers allocated")
     for (container <- containers.asScala) { // Launch container by create ContainerLaunchContext
-      val containerTask = Future[ActionData] {
-        val taskData = DataLoader.getTaskDataString(actionData, env)
-        val execData = DataLoader.getExecutorDataString(env, amaClusterConfig)
+      if (actionsBuffer.isEmpty) {
+        log.warn(s"Why actionBuffer empty and i was called?. Container ids: ${containers.map(c => c.getId.getContainerId)}")
+        return
+      }
 
+      val actionData = actionsBuffer.poll()
+      val containerTask = Future[ActionData] {
+
+        val frameworkFactory = FrameworkProvidersFactory(env, config)
+        val framework = frameworkFactory.getFramework(actionData.groupId)
+        val runnerProvider = framework.getRunnerProvider(actionData.typeId)
         val ctx = Records.newRecord(classOf[ContainerLaunchContext])
-        val commands: List[String] = List(
-          "/bin/bash ./miniconda.sh -b -p $PWD/miniconda && ",
-          s"/bin/bash spark/bin/load-spark-env.sh && ",
-          s"java -cp spark/jars/*:executor.jar:spark-runner.jar:spark-runtime.jar:spark/conf/:${amaClusterConfig.YARN.hadoopHomeDir}/conf/ " +
-            "-Xmx2G " +
-            "-Dscala.usejavacp=true " +
-            "org.apache.amaterasu.executor.yarn.executors.ActionsExecutorLauncher " +
-            s"'${jobManager.jobId}' '${amaClusterConfig.master}' '${actionData.name}' " +
-            s"'${URLEncoder.encode(taskData, "UTF-8")}' '${URLEncoder.encode(execData, "UTF-8")}' " +
-            s"'${actionData.id}-${container.getId.getContainerId}' '$address' " +
-            s"1> ${ApplicationConstants.LOG_DIR_EXPANSION_VAR}/stdout " +
-            s"2> ${ApplicationConstants.LOG_DIR_EXPANSION_VAR}/stderr "
-        )
+        val commands: List[String] = List(runnerProvider.getCommand(jobManager.jobId, actionData, env, s"${actionData.id}-${container.getId.getContainerId}"))
 
         log.info("Running container id {}.", container.getId.getContainerId)
         log.info("Running container id {} with command '{}'", container.getId.getContainerId, commands.last)
@@ -270,7 +254,7 @@ class ApplicationMaster extends Logging {
         ctx.setCommands(commands)
         ctx.setTokens(allTokens)
 
-        val yarnJarPath = new Path(amaClusterConfig.YARN.hdfsJarsPath)
+        val yarnJarPath = new Path(config.YARN.hdfsJarsPath)
 
         //TODO Arun - Remove the hardcoding of the dist path
         /*  val resources = mutable.Map[String, LocalResource]()
@@ -283,9 +267,9 @@ class ApplicationMaster extends Logging {
           resources ("amaterasu.properties") = setLocalResourceFromPath(fs.makeQualified(new Path(s"${config.YARN.hdfsJarsPath}/amaterasu.properties")))*/
 
         val resources = mutable.Map[String, LocalResource](
-          "executor.jar" -> setLocalResourceFromPath(Path.mergePaths(yarnJarPath, new Path(s"/dist/executor-${amaClusterConfig.version}-all.jar"))),
-          "spark-runner.jar" -> setLocalResourceFromPath(Path.mergePaths(yarnJarPath, new Path(s"/dist/spark-runner-${amaClusterConfig.version}-all.jar"))),
-          "spark-runtime.jar" -> setLocalResourceFromPath(Path.mergePaths(yarnJarPath, new Path(s"/dist/spark-runtime-${amaClusterConfig.version}.jar"))),
+          "executor.jar" -> setLocalResourceFromPath(Path.mergePaths(yarnJarPath, new Path(s"/dist/executor-${config.version}-all.jar"))),
+          "spark-runner.jar" -> setLocalResourceFromPath(Path.mergePaths(yarnJarPath, new Path(s"/dist/spark-runner-${config.version}-all.jar"))),
+          "spark-runtime.jar" -> setLocalResourceFromPath(Path.mergePaths(yarnJarPath, new Path(s"/dist/spark-runtime-${config.version}.jar"))),
           "amaterasu.properties" -> setLocalResourceFromPath(Path.mergePaths(yarnJarPath, new Path("/amaterasu.properties"))),
           "log4j.properties" -> setLocalResourceFromPath(Path.mergePaths(yarnJarPath, new Path("/log4j.properties"))),
           // TODO: Nadav/Eyal all of these should move to the executor resource setup
@@ -295,8 +279,6 @@ class ApplicationMaster extends Logging {
           "spark-version-info.properties" -> setLocalResourceFromPath(Path.mergePaths(yarnJarPath, new Path("/dist/spark-version-info.properties"))),
           "spark_intp.py" -> setLocalResourceFromPath(Path.mergePaths(yarnJarPath, new Path("/dist/spark_intp.py"))))
 
-        val frameworkFactory = FrameworkProvidersFactory(env, amaClusterConfig)
-        val framework = frameworkFactory.getFramework(actionData.groupId)
 
         //adding the framework and executor resources
         setupResources(yarnJarPath, framework.getGroupIdentifier, resources, framework.getGroupIdentifier)
@@ -305,13 +287,13 @@ class ApplicationMaster extends Logging {
         ctx.setLocalResources(resources)
 
         ctx.setEnvironment(Map[String, String](
-          "HADOOP_CONF_DIR" -> s"${amaClusterConfig.YARN.hadoopHomeDir}/conf/",
-          "YARN_CONF_DIR" -> s"${amaClusterConfig.YARN.hadoopHomeDir}/conf/",
+          "HADOOP_CONF_DIR" -> s"${config.YARN.hadoopHomeDir}/conf/",
+          "YARN_CONF_DIR" -> s"${config.YARN.hadoopHomeDir}/conf/",
           "AMA_NODE" -> sys.env("AMA_NODE"),
           "HADOOP_USER_NAME" -> UserGroupInformation.getCurrentUser.getUserName
         ))
 
-        log.info(s"hadoop conf dir is ${amaClusterConfig.YARN.hadoopHomeDir}/conf/")
+        log.info(s"hadoop conf dir is ${config.YARN.hadoopHomeDir}/conf/")
         nmClient.startContainerAsync(container, ctx)
         actionData
       }
@@ -319,13 +301,13 @@ class ApplicationMaster extends Logging {
       containerTask onComplete {
         case Failure(t) =>
           log.error(s"launching container failed", t)
-          val capability: Resource = getCapabilityFromAction(actionData)
-          askContainer(actionData, capability)
+          askContainer(actionData)
 
         case Success(requestedActionData) =>
           jobManager.actionStarted(requestedActionData.id)
           containersIdsToTask.put(container.getId.getContainerId, requestedActionData)
           log.info(s"launching container succeeded: ${container.getId.getContainerId}; task: ${requestedActionData.id}")
+
       }
     }
   }
@@ -350,9 +332,9 @@ class ApplicationMaster extends Logging {
 
     val sourcePath = Path.mergePaths(yarnJarPath, new Path(s"/$resourcesPath"))
 
-    if (hdfs.exists(sourcePath)) {
+    if (fs.exists(sourcePath)) {
 
-      val files = hdfs.listFiles(sourcePath, true)
+      val files = fs.listFiles(sourcePath, true)
 
       while (files.hasNext) {
         val res = files.next()
@@ -378,7 +360,7 @@ class ApplicationMaster extends Logging {
     nmClient.stop()
   }
 
-  def onContainersCompleted(statuses: util.List[ContainerStatus]): Unit = {
+  override def onContainersCompleted(statuses: util.List[ContainerStatus]): Unit = {
 
     for (status <- statuses.asScala) {
 
@@ -410,20 +392,20 @@ class ApplicationMaster extends Logging {
     }
   }
 
-  def getProgress: Float = {
+  override def getProgress: Float = {
     jobManager.registeredActions.size.toFloat / completedContainersAndTaskIds.size
   }
 
-  def onNodesUpdated(updatedNodes: util.List[NodeReport]): Unit = {
+  override def onNodesUpdated(updatedNodes: util.List[NodeReport]): Unit = {
     log.info("Nodes change. Nothing to report.")
   }
 
-  def onShutdownRequest(): Unit = {
+  override def onShutdownRequest(): Unit = {
     log.error("Shutdown requested.")
     stopApplication(FinalApplicationStatus.KILLED, "Shutdown requested")
   }
 
-  def onError(e: Throwable): Unit = {
+  override def onError(e: Throwable): Unit = {
     log.error("Error on AM", e)
     stopApplication(FinalApplicationStatus.FAILED, "Error on AM")
   }
@@ -434,8 +416,8 @@ class ApplicationMaster extends Logging {
     this.branch = args.branch
     try {
       val retryPolicy = new ExponentialBackoffRetry(1000, 3)
-      zkClient = CuratorFrameworkFactory.newClient(amaClusterConfig.zk, retryPolicy)
-      zkClient.start()
+      client = CuratorFrameworkFactory.newClient(config.zk, retryPolicy)
+      client.start()
     } catch {
       case e: Exception =>
         log.error("Error connecting to zookeeper", e)
@@ -445,8 +427,8 @@ class ApplicationMaster extends Logging {
       log.info("resuming job" + args.jobId)
       jobManager = JobLoader.reloadJob(
         args.jobId,
-        zkClient,
-        amaClusterConfig.Jobs.Tasks.attempts,
+        client,
+        config.Jobs.Tasks.attempts,
         new LinkedBlockingQueue[ActionData])
 
     } else {
@@ -457,8 +439,8 @@ class ApplicationMaster extends Logging {
           args.repo,
           args.branch,
           args.newJobId,
-          zkClient,
-          amaClusterConfig.Jobs.Tasks.attempts,
+          client,
+          config.Jobs.Tasks.attempts,
           new LinkedBlockingQueue[ActionData])
       } catch {
         case e: Exception =>
