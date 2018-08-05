@@ -243,7 +243,7 @@ class ApplicationMaster extends Logging {var capability: Resource = _
     log.info(s"${containers.size()} Containers allocated")
     for (container <- containers.asScala) { // Launch container by create ContainerLaunchContext
       val containerTask = Future[ActionData] {
-        val frameworkFactory = FrameworkProvidersFactory(env, config)
+         val frameworkFactory = FrameworkProvidersFactory(env, amaClusterConfig)
         val framework = frameworkFactory.getFramework(actionData.groupId)
         val runnerProvider = framework.getRunnerProvider(actionData.typeId)
         val ctx = Records.newRecord(classOf[ContainerLaunchContext])
