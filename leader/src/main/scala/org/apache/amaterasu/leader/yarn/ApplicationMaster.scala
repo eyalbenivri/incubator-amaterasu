@@ -20,7 +20,7 @@ import java.io.{File, FileInputStream, InputStream}
 import java.net.{InetAddress, ServerSocket}
 import java.nio.ByteBuffer
 import java.util
-import java.util.concurrent.{ConcurrentHashMap, ConcurrentLinkedQueue, LinkedBlockingQueue}
+import java.util.concurrent.{ConcurrentHashMap, LinkedBlockingQueue}
 
 import javax.jms.Session
 import org.apache.activemq.ActiveMQConnectionFactory
