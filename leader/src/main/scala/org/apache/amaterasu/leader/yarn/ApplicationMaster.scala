@@ -226,13 +226,22 @@ class ApplicationMaster extends Logging {var capability: Resource = _
     // we have an action to schedule, let's request a container
     val priority = Priority.newInstance(1)
     val containerReq = new ContainerRequest(capability, null, null, priority)
-    rmClient.addContainerRequest(containerReq)
-    log.info(s"Asked container for action ${actionData.id}")
-    val allocateResponse = rmClient.allocate(this.getProgress)
+    log.info(s"Asking container for action ${actionData.id}")
+    import scala.util.control.Breaks._
+    breakable {
+      while (true) {
+        rmClient.addContainerRequest(containerReq)
+        val allocateResponse = rmClient.allocate(this.getProgress)
+        if (allocateResponse.getAllocatedContainers.size() > 0) {
+          this.onContainersAllocated(allocateResponse.getAllocatedContainers, actionData)
+          break
+        }
+      }
+    }
+
     // only -* NEWLY *- allocated containers should be here, so as long as we ask for them one at a time, we can assume the list will contain 1 container (or 0),
     // which mean we can just activate the current task.
     // having said that, after that, we should launch the command on the container using a thread, to not block more actions.
-    this.onContainersAllocated(allocateResponse.getAllocatedContainers, actionData)
   }
 
   def resourceToString(resource: Resource): String = {
@@ -243,7 +252,7 @@ class ApplicationMaster extends Logging {var capability: Resource = _
     log.info(s"${containers.size()} Containers allocated")
     for (container <- containers.asScala) { // Launch container by create ContainerLaunchContext
       val containerTask = Future[ActionData] {
-         val frameworkFactory = FrameworkProvidersFactory(env, amaClusterConfig)
+        val frameworkFactory = FrameworkProvidersFactory(env, amaClusterConfig)
         val framework = frameworkFactory.getFramework(actionData.groupId)
         val runnerProvider = framework.getRunnerProvider(actionData.typeId)
         val ctx = Records.newRecord(classOf[ContainerLaunchContext])
