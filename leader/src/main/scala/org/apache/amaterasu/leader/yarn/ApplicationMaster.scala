@@ -38,10 +38,9 @@ import org.apache.hadoop.fs.{FileSystem, Path}
 import org.apache.hadoop.io.DataOutputBuffer
 import org.apache.hadoop.security.UserGroupInformation
 import org.apache.hadoop.yarn.api.records._
-import org.apache.hadoop.yarn.client.api.AMRMClient
+import org.apache.hadoop.yarn.client.api.{AMRMClient, NMClient}
 import org.apache.hadoop.yarn.client.api.AMRMClient.ContainerRequest
-import org.apache.hadoop.yarn.client.api.async.NMClientAsync
-import org.apache.hadoop.yarn.client.api.async.impl.NMClientAsyncImpl
+import org.apache.hadoop.yarn.client.api.impl.NMClientImpl
 import org.apache.hadoop.yarn.conf.YarnConfiguration
 import org.apache.hadoop.yarn.security.AMRMTokenIdentifier
 import org.apache.hadoop.yarn.util.{ConverterUtils, Records}
@@ -71,8 +70,7 @@ class ApplicationMaster extends Logging {var capability: Resource = _
   private var executorJar: LocalResource = _
   private var propFile: LocalResource = _
   private var log4jPropFile: LocalResource = _
-  private var nmClient: NMClientAsync = _
-  private var allocListener: YarnRMCallbackHandler = _
+  private var nmClient: NMClient = _
   private var rmClient: AMRMClient[ContainerRequest] = _
   private var address: String = _
   private var frameworkFactory: FrameworkProvidersFactory = _
@@ -144,14 +142,11 @@ class ApplicationMaster extends Logging {var capability: Resource = _
 
     log.info("Started execute")
 
-    nmClient = new NMClientAsyncImpl(new YarnNMCallbackHandler())
+    nmClient = new NMClientImpl("AmaterasuNMClient")
 
     // Initialize clients to ResourceManager and NodeManagers
     nmClient.init(yarnConfiguration)
     nmClient.start()
-
-    // TODO: awsEnv currently set to empty string. should be changed to read values from (where?).
-    allocListener = new YarnRMCallbackHandler(nmClient, jobManager, env, awsEnv = "", amaClusterConfig, executorJar)
 
     rmClient = startRMClient()
     val registrationResponse = registerAppMaster("", 0, "")
@@ -235,8 +230,9 @@ class ApplicationMaster extends Logging {var capability: Resource = _
         // only -* NEWLY *- allocated containers should be here, so as long as we ask for them one at a time, we can assume the list will contain 1 container (or 0),
         // which mean we can just activate the current task.
         // having said that, after that, we should launch the command on the container using a thread, to not block more actions.
-        if (allocateResponse.getAllocatedContainers.size() > 0) {
-          this.onContainersAllocated(allocateResponse.getAllocatedContainers, actionData)
+        val allocatedContainers = allocateResponse.getAllocatedContainers
+        if (allocatedContainers.size() > 0) {
+          this.onContainersAllocated(allocatedContainers, actionData)
           break
         }
       }
@@ -297,7 +293,7 @@ class ApplicationMaster extends Logging {var capability: Resource = _
         ))
 
         log.info(s"hadoop conf dir is ${amaClusterConfig.YARN.hadoopHomeDir}/conf/")
-        nmClient.startContainerAsync(container, ctx)
+        nmClient.startContainer(container, ctx)
         actionData
       }
 
