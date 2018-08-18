@@ -228,31 +228,25 @@ class ApplicationMaster extends Logging {var capability: Resource = _
     val containerReq = new ContainerRequest(capability, null, null, priority)
     log.info(s"Asking container for action ${actionData.id}")
     import scala.util.control.Breaks._
+    rmClient.addContainerRequest(containerReq)
     breakable {
       while (true) {
-        rmClient.addContainerRequest(containerReq)
         val allocateResponse = rmClient.allocate(this.getProgress)
+        // only -* NEWLY *- allocated containers should be here, so as long as we ask for them one at a time, we can assume the list will contain 1 container (or 0),
+        // which mean we can just activate the current task.
+        // having said that, after that, we should launch the command on the container using a thread, to not block more actions.
         if (allocateResponse.getAllocatedContainers.size() > 0) {
           this.onContainersAllocated(allocateResponse.getAllocatedContainers, actionData)
           break
         }
       }
     }
-
-    // only -* NEWLY *- allocated containers should be here, so as long as we ask for them one at a time, we can assume the list will contain 1 container (or 0),
-    // which mean we can just activate the current task.
-    // having said that, after that, we should launch the command on the container using a thread, to not block more actions.
-  }
-
-  def resourceToString(resource: Resource): String = {
-    s"Resource<${resource.getVirtualCores} vcores, ${resource.getMemory} mem>"
   }
 
   def onContainersAllocated(containers: util.List[Container], actionData: ActionData): Unit = {
     log.info(s"${containers.size()} Containers allocated")
     for (container <- containers.asScala) { // Launch container by create ContainerLaunchContext
       val containerTask = Future[ActionData] {
-        val frameworkFactory = FrameworkProvidersFactory(env, amaClusterConfig)
         val framework = frameworkFactory.getFramework(actionData.groupId)
         val runnerProvider = framework.getRunnerProvider(actionData.typeId)
         val ctx = Records.newRecord(classOf[ContainerLaunchContext])
@@ -288,8 +282,6 @@ class ApplicationMaster extends Logging {var capability: Resource = _
           "runtime.py" -> setLocalResourceFromPath(Path.mergePaths(yarnJarPath, new Path("/dist/runtime.py"))),
           "spark-version-info.properties" -> setLocalResourceFromPath(Path.mergePaths(yarnJarPath, new Path("/dist/spark-version-info.properties"))),
           "spark_intp.py" -> setLocalResourceFromPath(Path.mergePaths(yarnJarPath, new Path("/dist/spark_intp.py"))))
-
-
 
         //adding the framework and executor resources
         setupResources(yarnJarPath, framework.getGroupIdentifier, resources, framework.getGroupIdentifier)
